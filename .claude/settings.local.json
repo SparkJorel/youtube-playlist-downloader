@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install:*)",
+      "Bash(python -c \":*)",
+      "Bash(node --version:*)",
+      "Bash(python -m yt_dlp:*)",
+      "Bash(where:*)",
+      "Bash(winget install:*)",
+      "Bash(python:*)",
+      "Bash(pip uninstall:*)",
+      "Bash(gh auth:*)",
+      "Bash(git init:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
+    ]
+  }
+}
