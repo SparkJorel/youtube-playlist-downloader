@@ -6,6 +6,7 @@ build/
 *.spec
 *.egg-info/
 .downloaded.txt
+.playlists_done.json
 cookies.txt
 *.exe
 .claude/

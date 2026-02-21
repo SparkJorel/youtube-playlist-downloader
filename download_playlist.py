@@ -1,9 +1,11 @@
+import json
 import os
 import re
 import shutil
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlparse, parse_qs
 import tkinter as tk
 from tkinter import ttk, scrolledtext, filedialog
 
@@ -39,6 +41,55 @@ def clean_folder_name(name):
     name = re.sub(r'[<>:"/\\|?*]', "", name)
     name = name.strip(". ")
     return name if name else "download"
+
+
+REGISTRY_FILE = ".playlists_done.json"
+
+
+def _registry_path(output_dir):
+    return os.path.join(output_dir or ".", REGISTRY_FILE)
+
+
+def load_registry(output_dir):
+    path = _registry_path(output_dir)
+    if os.path.isfile(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def save_registry(output_dir, registry):
+    path = _registry_path(output_dir)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(registry, f, indent=2, ensure_ascii=False)
+
+
+def extract_playlist_id(url):
+    """Extrait l'ID de playlist depuis une URL YouTube sans requete reseau."""
+    parsed = urlparse(url)
+    qs = parse_qs(parsed.query)
+    if "list" in qs:
+        return qs["list"][0]
+    return None
+
+
+def is_playlist_done(url, output_dir, registry):
+    """Verifie localement si une playlist a deja ete telechargee."""
+    pid = extract_playlist_id(url)
+    if not pid or pid not in registry:
+        return False
+    folder = registry[pid]
+    folder_path = os.path.join(output_dir or ".", folder)
+    archive = os.path.join(folder_path, ".downloaded.txt")
+    return os.path.isdir(folder_path) and os.path.isfile(archive)
+
+
+def mark_playlist_done(url, folder_name, output_dir, registry):
+    """Enregistre une playlist comme telechargee."""
+    pid = extract_playlist_id(url)
+    if pid:
+        registry[pid] = folder_name
+        save_registry(output_dir, registry)
 
 
 def base_opts():
@@ -143,8 +194,36 @@ def make_progress_hook(tag, log_func):
     return progress_hook
 
 
+AUTH_ERRORS = [
+    "Sign in to confirm",
+    "confirm you're not a bot",
+    "This content isn't available",
+    "rate-limited",
+    "Sign in if you've been granted",
+]
+
+PRIVATE_ERRORS = [
+    "Private video",
+    "Video unavailable",
+]
+
+MAX_RETRIES = 3
+RETRY_WAIT = 60
+
+
+def _is_auth_error(error_msg):
+    msg = str(error_msg).lower()
+    return any(e.lower() in msg for e in AUTH_ERRORS)
+
+
+def _is_private_error(error_msg):
+    msg = str(error_msg).lower()
+    return any(e.lower() in msg for e in PRIVATE_ERRORS)
+
+
 def download_one_item(url, index, total, output_dir, cookie_opts, quality_fmt,
-                      is_audio, audio_fmt, fragments, sub_opts, playlist_range, log_func):
+                      is_audio, audio_fmt, fragments, sub_opts, playlist_range, log_func,
+                      registry=None, folder_override=None):
     """Telecharge un item (video, playlist, ou chaine). Retourne True si OK."""
     tag = f"[{index}/{total}]"
 
@@ -152,18 +231,30 @@ def download_one_item(url, index, total, output_dir, cookie_opts, quality_fmt,
     log_func(f"  {tag} {url}")
     log_func(f"{'='*50}\n")
 
-    # Recuperer les infos
-    log_func(f"  {tag} Recuperation des infos...")
-    info_opts = base_opts()
-    info_opts["quiet"] = True
-    info_opts.update(cookie_opts)
+    # Recuperer les infos avec retry sur erreurs d'auth
+    info = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        log_func(f"  {tag} Recuperation des infos...")
+        info_opts = base_opts()
+        info_opts["quiet"] = True
+        info_opts.update(cookie_opts)
 
-    with yt_dlp.YoutubeDL(info_opts) as ydl:
-        try:
-            info = ydl.extract_info(url, download=False)
-        except Exception as e:
-            log_func(f"  {tag} ERREUR : {e}")
-            return False
+        with yt_dlp.YoutubeDL(info_opts) as ydl:
+            try:
+                info = ydl.extract_info(url, download=False)
+                break
+            except Exception as e:
+                error_msg = str(e)
+                if _is_private_error(error_msg):
+                    log_func(f"  {tag} Video privee — ignoree.")
+                    return False
+                if _is_auth_error(error_msg) and attempt < MAX_RETRIES:
+                    wait = RETRY_WAIT * attempt
+                    log_func(f"  {tag} Rate-limit detecte ! Pause de {wait}s avant retry ({attempt}/{MAX_RETRIES})...")
+                    time.sleep(wait)
+                    continue
+                log_func(f"  {tag} ERREUR : {e}")
+                return False
 
     if not info:
         log_func(f"  {tag} ERREUR : aucune info trouvee.")
@@ -172,7 +263,7 @@ def download_one_item(url, index, total, output_dir, cookie_opts, quality_fmt,
     # Determiner le nom et le template de sortie
     is_playlist = "entries" in info
     title = info.get("title") or info.get("playlist_title") or "download"
-    folder = clean_folder_name(title)
+    folder = clean_folder_name(folder_override or title)
 
     if is_playlist:
         video_count = sum(1 for e in info.get("entries", []) if e)
@@ -186,7 +277,8 @@ def download_one_item(url, index, total, output_dir, cookie_opts, quality_fmt,
         out_path = output_dir if output_dir else "."
         outtmpl = f"{out_path}/%(title)s.%(ext)s"
 
-    archive_path = f"{out_path}/.downloaded.txt" if is_playlist else None
+    # Archive globale dans le dossier de destination (partagee entre tous les modes)
+    global_archive = os.path.join(output_dir or ".", ".downloaded.txt")
 
     # Construire les options
     opts = base_opts()
@@ -200,11 +292,9 @@ def download_one_item(url, index, total, output_dir, cookie_opts, quality_fmt,
         "max_sleep_interval": 5,
         "sleep_interval_requests": 1,
         "sleep_interval_subtitles": 2,
+        "download_archive": global_archive,
     })
     opts.update(aria2c_opts())
-
-    if archive_path:
-        opts["download_archive"] = archive_path
 
     # Plage de videos (playlist uniquement)
     if is_playlist and playlist_range:
@@ -229,16 +319,48 @@ def download_one_item(url, index, total, output_dir, cookie_opts, quality_fmt,
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.download([url])
 
+    # Enregistrer la playlist comme telechargee
+    if is_playlist and registry is not None:
+        mark_playlist_done(url, folder, output_dir, registry)
+
     log_func(f"\n  {tag} '{title}' OK !")
     return True
 
 
-def download_all(urls, output_dir, cookie_mode, cookie_value, quality_fmt,
+def download_all(items, output_dir, cookie_mode, cookie_value, quality_fmt,
                  is_audio, audio_fmt, fragments, parallel, sub_opts, playlist_range,
                  log_func, on_done):
-    total = len(urls)
+    """items : liste de URLs (str) ou tuples (url, folder_override)."""
     cookie_opts = build_cookie_opts(cookie_mode, cookie_value)
 
+    # Normaliser : chaque item devient (url, folder_override)
+    normalized = []
+    for item in items:
+        if isinstance(item, tuple):
+            normalized.append(item)
+        else:
+            normalized.append((item, None))
+
+    # Charger le registre et filtrer les playlists deja telechargees
+    registry = load_registry(output_dir)
+    new_items = []
+    skipped = 0
+    for url, folder_ov in normalized:
+        if is_playlist_done(url, output_dir, registry):
+            skipped += 1
+        else:
+            new_items.append((url, folder_ov))
+
+    if skipped:
+        log_func(f"  {skipped} playlist(s) deja telechargee(s) — ignoree(s)")
+
+    if not new_items:
+        log_func("  Rien a telecharger, tout est deja a jour !")
+        on_done()
+        return
+
+    total = len(new_items)
+    log_func(f"  {total} lien(s) a telecharger")
     log_func(f"  {fragments} fragments simultanes par video")
     log_func(f"  {parallel} telechargement(s) en parallele\n")
 
@@ -246,21 +368,23 @@ def download_all(urls, output_dir, cookie_mode, cookie_value, quality_fmt,
     fail = 0
 
     if parallel <= 1:
-        for i, url in enumerate(urls, 1):
+        for i, (url, folder_ov) in enumerate(new_items, 1):
             if i > 1:
                 log_func("  Pause anti rate-limit (5s)...")
                 time.sleep(5)
             if download_one_item(url, i, total, output_dir, cookie_opts, quality_fmt,
-                                 is_audio, audio_fmt, fragments, sub_opts, playlist_range, log_func):
+                                 is_audio, audio_fmt, fragments, sub_opts, playlist_range, log_func,
+                                 registry=registry, folder_override=folder_ov):
                 ok += 1
             else:
                 fail += 1
     else:
         with ThreadPoolExecutor(max_workers=parallel) as pool:
             futures = {}
-            for i, url in enumerate(urls, 1):
+            for i, (url, folder_ov) in enumerate(new_items, 1):
                 f = pool.submit(download_one_item, url, i, total, output_dir, cookie_opts,
-                                quality_fmt, is_audio, audio_fmt, fragments, sub_opts, playlist_range, log_func)
+                                quality_fmt, is_audio, audio_fmt, fragments, sub_opts, playlist_range, log_func,
+                                registry, folder_ov)
                 futures[f] = url
 
             for f in as_completed(futures):
@@ -274,7 +398,7 @@ def download_all(urls, output_dir, cookie_mode, cookie_value, quality_fmt,
                     fail += 1
 
     log_func(f"\n{'='*50}")
-    log_func(f"  TERMINE — {ok} reussie(s), {fail} echouee(s)")
+    log_func(f"  TERMINE — {ok} reussie(s), {fail} echouee(s), {skipped} ignoree(s)")
     log_func(f"{'='*50}")
     on_done()
 
@@ -674,8 +798,15 @@ class App(tk.Tk):
                 self._log("Colle le lien de la chaine YouTube d'abord.")
                 return
             cookie_opts_check = self._get_cookie_opts()
+            # 1) Videos individuelles d'abord
+            self._log("Etape 1 : Recuperation des videos individuelles...")
             video_url = fetch_channel_all_videos(url, cookie_opts_check, self._log)
-            urls = [video_url]
+            # 2) Puis les playlists
+            self._log("Etape 2 : Recuperation des playlists de la chaine...")
+            playlist_urls = fetch_channel_playlists(url, cookie_opts_check, self._log)
+            # Combiner : videos individuelles d'abord, puis playlists
+            urls = [(video_url, "Videos individuelles")] + list(playlist_urls)
+            self._log(f"  Videos individuelles + {len(playlist_urls)} playlist(s)")
         else:
             raw = self.input_text.get("1.0", "end").strip()
             urls = [u.strip() for u in raw.splitlines() if u.strip()]
