@@ -19,11 +19,11 @@ BROWSERS = ["chrome", "edge", "firefox", "opera", "brave", "vivaldi"]
 MODES = ["Video(s)", "Playlist(s)", "Chaine complete"]
 
 QUALITIES = {
-    "2160p (4K)":      "bestvideo[height<=2160][ext=mp4]+bestaudio[ext=m4a]/best[height<=2160]/best",
-    "1080p (Full HD)": "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080]/best",
-    "720p (HD)":       "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720]/best",
-    "480p":            "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480]/best",
-    "360p":            "bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/best[height<=360]/best",
+    "2160p (4K)":      "bestvideo[height<=2160]+bestaudio/best[height<=2160]/best",
+    "1080p (Full HD)": "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
+    "720p (HD)":       "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
+    "480p":            "bestvideo[height<=480]+bestaudio/best[height<=480]/best",
+    "360p":            "bestvideo[height<=360]+bestaudio/best[height<=360]/best",
     "Audio uniquement": "bestaudio/best",
 }
 
@@ -223,9 +223,13 @@ def _is_private_error(error_msg):
 
 def download_one_item(url, index, total, output_dir, cookie_opts, quality_fmt,
                       is_audio, audio_fmt, fragments, sub_opts, playlist_range, log_func,
-                      registry=None, folder_override=None):
+                      registry=None, folder_override=None, stop_event=None):
     """Telecharge un item (video, playlist, ou chaine). Retourne True si OK."""
     tag = f"[{index}/{total}]"
+
+    if stop_event and stop_event.is_set():
+        log_func(f"  {tag} Arrete par l'utilisateur.")
+        return False
 
     log_func(f"\n{'='*50}")
     log_func(f"  {tag} {url}")
@@ -234,6 +238,9 @@ def download_one_item(url, index, total, output_dir, cookie_opts, quality_fmt,
     # Recuperer les infos avec retry sur erreurs d'auth
     info = None
     for attempt in range(1, MAX_RETRIES + 1):
+        if stop_event and stop_event.is_set():
+            log_func(f"  {tag} Arrete par l'utilisateur.")
+            return False
         log_func(f"  {tag} Recuperation des infos...")
         info_opts = base_opts()
         info_opts["quiet"] = True
@@ -251,7 +258,12 @@ def download_one_item(url, index, total, output_dir, cookie_opts, quality_fmt,
                 if _is_auth_error(error_msg) and attempt < MAX_RETRIES:
                     wait = RETRY_WAIT * attempt
                     log_func(f"  {tag} Rate-limit detecte ! Pause de {wait}s avant retry ({attempt}/{MAX_RETRIES})...")
-                    time.sleep(wait)
+                    # Attente interruptible
+                    for _ in range(wait):
+                        if stop_event and stop_event.is_set():
+                            log_func(f"  {tag} Arrete par l'utilisateur.")
+                            return False
+                        time.sleep(1)
                     continue
                 log_func(f"  {tag} ERREUR : {e}")
                 return False
@@ -317,7 +329,11 @@ def download_one_item(url, index, total, output_dir, cookie_opts, quality_fmt,
     opts.update(cookie_opts)
 
     with yt_dlp.YoutubeDL(opts) as ydl:
-        ydl.download([url])
+        try:
+            ydl.download([url])
+        except Exception as e:
+            log_func(f"  {tag} Erreur durant le telechargement : {e}")
+            log_func(f"  {tag} Telechargement partiel — on continue.")
 
     # Enregistrer la playlist comme telechargee
     if is_playlist and registry is not None:
@@ -329,7 +345,7 @@ def download_one_item(url, index, total, output_dir, cookie_opts, quality_fmt,
 
 def download_all(items, output_dir, cookie_mode, cookie_value, quality_fmt,
                  is_audio, audio_fmt, fragments, parallel, sub_opts, playlist_range,
-                 log_func, on_done):
+                 log_func, on_done, stop_event=None):
     """items : liste de URLs (str) ou tuples (url, folder_override)."""
     cookie_opts = build_cookie_opts(cookie_mode, cookie_value)
 
@@ -366,15 +382,25 @@ def download_all(items, output_dir, cookie_mode, cookie_value, quality_fmt,
 
     ok = 0
     fail = 0
+    stopped = False
 
     if parallel <= 1:
         for i, (url, folder_ov) in enumerate(new_items, 1):
+            if stop_event and stop_event.is_set():
+                stopped = True
+                break
             if i > 1:
                 log_func("  Pause anti rate-limit (5s)...")
-                time.sleep(5)
+                for _ in range(5):
+                    if stop_event and stop_event.is_set():
+                        stopped = True
+                        break
+                    time.sleep(1)
+                if stopped:
+                    break
             if download_one_item(url, i, total, output_dir, cookie_opts, quality_fmt,
                                  is_audio, audio_fmt, fragments, sub_opts, playlist_range, log_func,
-                                 registry=registry, folder_override=folder_ov):
+                                 registry=registry, folder_override=folder_ov, stop_event=stop_event):
                 ok += 1
             else:
                 fail += 1
@@ -382,12 +408,17 @@ def download_all(items, output_dir, cookie_mode, cookie_value, quality_fmt,
         with ThreadPoolExecutor(max_workers=parallel) as pool:
             futures = {}
             for i, (url, folder_ov) in enumerate(new_items, 1):
+                if stop_event and stop_event.is_set():
+                    break
                 f = pool.submit(download_one_item, url, i, total, output_dir, cookie_opts,
                                 quality_fmt, is_audio, audio_fmt, fragments, sub_opts, playlist_range, log_func,
-                                registry, folder_ov)
+                                registry, folder_ov, stop_event)
                 futures[f] = url
 
             for f in as_completed(futures):
+                if stop_event and stop_event.is_set():
+                    stopped = True
+                    break
                 try:
                     if f.result():
                         ok += 1
@@ -398,7 +429,10 @@ def download_all(items, output_dir, cookie_mode, cookie_value, quality_fmt,
                     fail += 1
 
     log_func(f"\n{'='*50}")
-    log_func(f"  TERMINE — {ok} reussie(s), {fail} echouee(s), {skipped} ignoree(s)")
+    if stopped:
+        log_func(f"  ARRETE — {ok} reussie(s), {fail} echouee(s), {skipped} ignoree(s)")
+    else:
+        log_func(f"  TERMINE — {ok} reussie(s), {fail} echouee(s), {skipped} ignoree(s)")
     log_func(f"{'='*50}")
     on_done()
 
@@ -442,6 +476,7 @@ class App(tk.Tk):
         self.channel_url = tk.StringVar(value="")
         self.downloading = False
         self.fetching = False
+        self.stop_event = threading.Event()
 
         self._setup_styles()
         self._build_ui()
@@ -463,6 +498,9 @@ class App(tk.Tk):
         style.configure("Channel.TButton", background="#1e3a5f", foreground=TEXT_COLOR,
                          font=("Segoe UI", 9), padding=(10, 5))
         style.map("Channel.TButton", background=[("active", "#254a6f"), ("disabled", "#4a4a5e")])
+        style.configure("Stop.TButton", background="#dc2626", foreground="white",
+                         font=("Segoe UI", 11, "bold"), padding=(20, 10))
+        style.map("Stop.TButton", background=[("active", "#b91c1c"), ("disabled", "#4a4a5e")])
         style.configure("Mode.TRadiobutton", background=BG, foreground=TEXT_COLOR, font=("Segoe UI", 10))
         style.map("Mode.TRadiobutton", background=[("active", BG)])
 
@@ -611,9 +649,14 @@ class App(tk.Tk):
         self.dir_label = ttk.Label(main, text="Dossier courant (par defaut)", style="Muted.TLabel")
         self.dir_label.pack(anchor="w", pady=(3, 0))
 
-        # === BOUTON ===
-        self.btn = ttk.Button(main, text="Telecharger", style="Accent.TButton", command=self._start)
-        self.btn.pack(pady=12)
+        # === BOUTONS ===
+        btn_frame = ttk.Frame(main)
+        btn_frame.pack(pady=12)
+        self.btn = ttk.Button(btn_frame, text="Telecharger", style="Accent.TButton", command=self._start)
+        self.btn.pack(side="left", padx=(0, 8))
+        self.stop_btn = ttk.Button(btn_frame, text="Arreter", style="Stop.TButton", command=self._stop)
+        self.stop_btn.pack(side="left")
+        self.stop_btn.config(state="disabled")
 
         # === CONSOLE ===
         ttk.Label(main, text="Progression :").pack(anchor="w", pady=(0, 5))
@@ -779,9 +822,16 @@ class App(tk.Tk):
             self.log.config(state="disabled")
         self.after(0, _write)
 
+    def _stop(self):
+        if self.downloading:
+            self.stop_event.set()
+            self.stop_btn.config(state="disabled")
+            self._log("\n  Arret demande... les telechargements en cours vont se terminer.")
+
     def _on_done(self):
         self.after(0, lambda: (
             self.btn.config(text="Telecharger", state="normal"),
+            self.stop_btn.config(state="disabled"),
             setattr(self, "downloading", False),
         ))
 
@@ -798,14 +848,12 @@ class App(tk.Tk):
                 self._log("Colle le lien de la chaine YouTube d'abord.")
                 return
             cookie_opts_check = self._get_cookie_opts()
-            # 1) Videos individuelles d'abord
-            self._log("Etape 1 : Recuperation des videos individuelles...")
+            self._log("Recuperation des videos individuelles et playlists...")
             video_url = fetch_channel_all_videos(url, cookie_opts_check, self._log)
-            # 2) Puis les playlists
-            self._log("Etape 2 : Recuperation des playlists de la chaine...")
             playlist_urls = fetch_channel_playlists(url, cookie_opts_check, self._log)
-            # Combiner : videos individuelles d'abord, puis playlists
-            urls = [(video_url, "Videos individuelles")] + list(playlist_urls)
+            # Stocker les deux phases pour _start_channel
+            self._channel_videos = [(video_url, "Videos individuelles")]
+            self._channel_playlists = list(playlist_urls)
             self._log(f"  Videos individuelles + {len(playlist_urls)} playlist(s)")
         else:
             raw = self.input_text.get("1.0", "end").strip()
@@ -844,18 +892,46 @@ class App(tk.Tk):
                                   int(end) if end.isdigit() else None)
 
         self.downloading = True
+        self.stop_event.clear()
         self.btn.config(text="Telechargement en cours...", state="disabled")
+        self.stop_btn.config(state="normal")
         self.log.config(state="normal")
         self.log.delete("1.0", "end")
         self.log.config(state="disabled")
-        self._log(f"Mode : {mode} | {len(urls)} lien(s) | {quality_key}")
+        if mode == "Chaine complete":
+            nb = len(self._channel_videos) + len(self._channel_playlists)
+        else:
+            nb = len(urls)
+        self._log(f"Mode : {mode} | {nb} lien(s) | {quality_key}")
 
         out = self.output_dir.get() or None
-        t = threading.Thread(target=download_all,
-                             args=(urls, out, cookie_mode, cookie_value, quality_fmt, is_audio,
-                                   audio_fmt, fragments, parallel, sub_opts, playlist_range,
-                                   self._log, self._on_done),
-                             daemon=True)
+
+        if mode == "Chaine complete":
+            # Deux phases : videos individuelles d'abord, puis playlists
+            def _channel_download():
+                self._log(f"\n{'='*50}")
+                self._log("  PHASE 1 : Videos individuelles")
+                self._log(f"{'='*50}")
+                download_all(self._channel_videos, out, cookie_mode, cookie_value, quality_fmt,
+                             is_audio, audio_fmt, fragments, parallel, sub_opts, playlist_range,
+                             self._log, lambda: None, self.stop_event)
+                if self.stop_event.is_set():
+                    self._on_done()
+                    return
+                self._log(f"\n{'='*50}")
+                self._log("  PHASE 2 : Playlists")
+                self._log(f"{'='*50}")
+                download_all(self._channel_playlists, out, cookie_mode, cookie_value, quality_fmt,
+                             is_audio, audio_fmt, fragments, parallel, sub_opts, playlist_range,
+                             self._log, self._on_done, self.stop_event)
+
+            t = threading.Thread(target=_channel_download, daemon=True)
+        else:
+            t = threading.Thread(target=download_all,
+                                 args=(urls, out, cookie_mode, cookie_value, quality_fmt, is_audio,
+                                       audio_fmt, fragments, parallel, sub_opts, playlist_range,
+                                       self._log, self._on_done, self.stop_event),
+                                 daemon=True)
         t.start()
 
 
