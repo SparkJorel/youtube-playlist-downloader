@@ -1,6 +1,7 @@
 import os
 import re
 import shutil
+import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import tkinter as tk
@@ -195,6 +196,10 @@ def download_one_item(url, index, total, output_dir, cookie_opts, quality_fmt,
         "ignoreerrors": True,
         "progress_hooks": [make_progress_hook(tag, log_func)],
         "concurrent_fragment_downloads": fragments,
+        "sleep_interval": 3,
+        "max_sleep_interval": 5,
+        "sleep_interval_requests": 1,
+        "sleep_interval_subtitles": 2,
     })
     opts.update(aria2c_opts())
 
@@ -242,6 +247,9 @@ def download_all(urls, output_dir, cookie_mode, cookie_value, quality_fmt,
 
     if parallel <= 1:
         for i, url in enumerate(urls, 1):
+            if i > 1:
+                log_func("  Pause anti rate-limit (5s)...")
+                time.sleep(5)
             if download_one_item(url, i, total, output_dir, cookie_opts, quality_fmt,
                                  is_audio, audio_fmt, fragments, sub_opts, playlist_range, log_func):
                 ok += 1
